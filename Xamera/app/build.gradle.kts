@@ -11,8 +11,8 @@ android {
         applicationId = "com.developer27.xamera"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.0.1"
 
         ndk {
             abiFilters += listOf("armeabi-v7a", "arm64-v8a")
@@ -65,9 +65,8 @@ android {
 
 dependencies {
     // OpenCV
-    implementation(project(":OpenCV-4.10.0")) {
-        exclude(group = "org.bytedeco", module = "libc++_shared")
-    }
+    // Includes the native libraries missing from the checked-in SDK module.
+    implementation("org.opencv:opencv:4.10.0")
 
     // PyTorch
     implementation("org.pytorch:pytorch_android:1.13.1") {

@@ -3,6 +3,7 @@ package com.developer27.xamera
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.content.ActivityNotFoundException
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
@@ -12,13 +13,11 @@ import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.graphics.SurfaceTexture
-import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.os.Bundle
-import android.os.Environment
-import android.preference.PreferenceManager
+import android.os.Build
+import androidx.preference.PreferenceManager
 import android.util.Log
-import android.util.SparseIntArray
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
@@ -32,33 +31,34 @@ import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.developer27.xamera.camera.CameraHelper
 import com.developer27.xamera.databinding.ActivityMainBinding
+import com.developer27.xamera.videoprocessing.MediaExporter
 import com.developer27.xamera.videoprocessing.ProcessedFrameRecorder
 import com.developer27.xamera.videoprocessing.ProcessedVideoRecorder
 import com.developer27.xamera.videoprocessing.Settings
 import com.developer27.xamera.videoprocessing.VideoProcessor
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.gpu.GpuDelegate
-import org.tensorflow.lite.nnapi.NnApiDelegate
 import java.io.File
-import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.MappedByteBuffer
-import java.nio.channels.FileChannel
 import kotlin.math.max
+import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var viewBinding: ActivityMainBinding
     private lateinit var sharedPreferences: SharedPreferences
-    private lateinit var cameraManager: CameraManager
     private lateinit var cameraHelper: CameraHelper
     private var tfliteInterpreter: Interpreter? = null
     // Interpreter for letter recognition.
     private var letterInterpreter: Interpreter? = null
 
     private var processedVideoRecorder: ProcessedVideoRecorder? = null
-    private var processedFrameRecorder: ProcessedFrameRecorder? = null
+    private var recordingFile: File? = null
+    private val processingExecutor = Executors.newSingleThreadExecutor()
+    private var sessionGeneration = 0
+    private var isFinalizing = false
+    private var isResumed = false
+    private var modelsReady = false
     private var videoProcessor: VideoProcessor? = null
 
     // Flag for tracking (start/stop tracking mode)
@@ -66,9 +66,6 @@ class MainActivity : AppCompatActivity() {
     // Flag for frame processing
     private var isProcessing = false
     private var isProcessingFrame = false
-
-    // Variable for inference result.
-    private var inferenceResult = ""
 
     // Stores the current session tracking coordinates.
     private var trackingCoordinates: String = ""
@@ -86,36 +83,21 @@ class MainActivity : AppCompatActivity() {
     // NEW: Accumulated handwriting coordinates (each element corresponds to one letter)
     private val accumulatedCoordinates = mutableListOf<String>()
 
-    // NEW: Flag to indicate a reset is happening, to guard against asynchronous updates.
-    private var isResetting = false
-
-    private val REQUIRED_PERMISSIONS = arrayOf(
-        Manifest.permission.CAMERA,
-        Manifest.permission.RECORD_AUDIO
-    )
+    private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
     private lateinit var requestPermissionLauncher: ActivityResultLauncher<Array<String>>
-
-    companion object {
-        private const val SETTINGS_REQUEST_CODE = 1
-        private val ORIENTATIONS = SparseIntArray().apply {
-            append(Surface.ROTATION_0, 90)
-            append(Surface.ROTATION_90, 0)
-            append(Surface.ROTATION_180, 270)
-            append(Surface.ROTATION_270, 180)
-        }
-    }
 
     private val textureListener = object : TextureView.SurfaceTextureListener {
         @SuppressLint("MissingPermission")
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
             if (allPermissionsGranted()) {
                 cameraHelper.openCamera()
-            } else {
-                requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
             }
         }
         override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
-        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = false
+        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+            cameraHelper.closeCamera()
+            return true
+        }
         override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
             if (isProcessing) {
                 processFrameWithVideoProcessor()
@@ -133,10 +115,12 @@ class MainActivity : AppCompatActivity() {
         setContentView(viewBinding.root)
 
         sharedPreferences = PreferenceManager.getDefaultSharedPreferences(this)
-        cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
+        PreferenceManager.setDefaultValues(this, R.xml.root_preferences, false)
+        Settings.load(sharedPreferences)
 
         cameraHelper = CameraHelper(this, viewBinding, sharedPreferences)
-        videoProcessor = VideoProcessor(this)
+        videoProcessor = VideoProcessor()
+        viewBinding.viewFinder.surfaceTextureListener = textureListener
 
         viewBinding.processedFrameView.visibility = View.GONE
         viewBinding.predictedLetterTextView.text = "No Prediction Yet"
@@ -144,32 +128,17 @@ class MainActivity : AppCompatActivity() {
         viewBinding.titleContainer.setOnClickListener {
             val url = "https://www.zhangxiao.me/"
             val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-            startActivity(intent)
+            launchExternalActivity(intent)
         }
 
-        requestPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
-            val camGranted = permissions[Manifest.permission.CAMERA] ?: false
-            val micGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
-            if (camGranted && micGranted) {
-                if (viewBinding.viewFinder.isAvailable) {
-                    cameraHelper.openCamera()
-                } else {
-                    viewBinding.viewFinder.surfaceTextureListener = textureListener
-                }
+        requestPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            if (allPermissionsGranted()) {
+                if (isResumed && viewBinding.viewFinder.isAvailable) cameraHelper.openCamera()
             } else {
-                Toast.makeText(this, "Camera & Audio permissions are required.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Camera permission is required for tracking.", Toast.LENGTH_SHORT).show()
             }
         }
-
-        if (allPermissionsGranted()) {
-            if (viewBinding.viewFinder.isAvailable) {
-                cameraHelper.openCamera()
-            } else {
-                viewBinding.viewFinder.surfaceTextureListener = textureListener
-            }
-        } else {
-            requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
-        }
+        if (!allPermissionsGranted()) requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
 
         viewBinding.startProcessingButton.setOnClickListener {
             if (isRecording) {
@@ -247,39 +216,29 @@ class MainActivity : AppCompatActivity() {
                 viewBinding.startWritingButton.backgroundTintList =
                     ContextCompat.getColorStateList(this, R.color.green)
             }
-            if (isRecording) {
-                stopProcessingAndRecording()
-            }
-            // Reset prediction text and stored coordinates while guarding against asynchronous updates.
-            isResetting = true
+            if (isRecording) stopProcessingAndRecording()
+            sessionGeneration++ // Discard any pending result from before Clear.
+            // Pending results are rejected by the session generation above.
             viewBinding.predictedLetterTextView.text = "No Prediction Yet"
             accumulatedCoordinates.clear()
             trackingCoordinates = ""
-            isResetting = false
         }
 
-        // Load ML models.
-        loadTFLiteModelOnStartupThreaded("YOLOv3_float32.tflite")
-        loadTFLiteModelOnStartupThreaded("DigitRecog_float32.tflite")
-        loadTFLiteModelOnStartupThreaded("LetterRecog_float32.tflite")
-
+        loadModels()
         cameraHelper.setupZoomControls()
-        sharedPreferences.registerOnSharedPreferenceChangeListener { _, key ->
-            if (key == "shutter_speed") {
-                cameraHelper.updateShutterSpeed()
-            }
-        }
     }
 
     // Function for toggling writing mode.
     private fun toggleWritingMode() {
+        if (isRecording || isFinalizing) {
+            Toast.makeText(this, "Stop tracking before changing writing mode.", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (!isWriting) {
-            // Reset any previously written content while setting a guard flag.
-            isResetting = true
+            // Begin a new writing session.
             viewBinding.predictedLetterTextView.text = ""
             accumulatedCoordinates.clear()
             trackingCoordinates = ""
-            isResetting = false
 
             isWriting = true
             viewBinding.startWritingButton.text = "Stop Writing"
@@ -291,6 +250,7 @@ class MainActivity : AppCompatActivity() {
             viewBinding.startWritingButton.backgroundTintList =
                 ContextCompat.getColorStateList(this, R.color.green)
             val prediction = viewBinding.predictedLetterTextView.text.toString()
+            if (prediction.isBlank() || prediction == "No Prediction Yet") return
             if (prediction.matches(Regex("^(?=.*[A-Za-z])(?=.*\\d).+$"))) {
                 AlertDialog.Builder(this)
                     .setTitle("Send Email")
@@ -327,70 +287,151 @@ class MainActivity : AppCompatActivity() {
             putExtra(Intent.EXTRA_SUBJECT, "Air-Written Email by Xamera")
             putExtra(Intent.EXTRA_TEXT, text)
         }
-        shouldClearPrediction = true
-        startActivity(emailIntent)
+        launchExternalActivity(emailIntent)
     }
 
     private fun startProcessingAndRecording() {
+        if (isFinalizing) return
+        if (!allPermissionsGranted()) {
+            requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
+            return
+        }
+        if (cameraHelper.cameraCaptureSession == null || !modelsReady) {
+            Toast.makeText(this, "Camera and recognition models are still loading.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+            (Settings.ExportData.videoDATA || Settings.ExportData.frameIMG) &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissionLauncher.launch(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE))
+            Toast.makeText(this, "Allow storage access, then start tracking again.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        sessionGeneration++
         isRecording = true
         isProcessing = true
         viewBinding.startProcessingButton.text = "Stop Tracking"
-        viewBinding.startProcessingButton.backgroundTintList =
-            ContextCompat.getColorStateList(this, R.color.red)
+        viewBinding.startProcessingButton.backgroundTintList = ContextCompat.getColorStateList(this, R.color.red)
         viewBinding.processedFrameView.visibility = View.VISIBLE
-
-        videoProcessor?.reset()
-        if (Settings.ExportData.videoDATA) {
-            val dims = videoProcessor?.getModelDimensions()
-            val width = dims?.first ?: 416
-            val height = dims?.second ?: 416
-            val outputPath = ProcessedVideoRecorder.getExportedVideoOutputPath()
-            processedVideoRecorder = ProcessedVideoRecorder(width, height, outputPath)
-            processedVideoRecorder?.start()
+        val saveVideo = Settings.ExportData.videoDATA
+        processingExecutor.execute {
+            videoProcessor?.reset()
+            if (saveVideo) {
+                try {
+                    val (width, height) = videoProcessor!!.getModelDimensions()
+                    val file = File.createTempFile("XameraVideo_", ".mp4", cacheDir)
+                    recordingFile = file
+                    processedVideoRecorder = ProcessedVideoRecorder(width, height, file.path).also { it.start() }
+                } catch (error: Exception) {
+                    discardRecording()
+                    reportError("Could not start video saving", error)
+                }
+            }
         }
     }
 
     private fun stopProcessingAndRecording() {
+        if (!isRecording) return
+        val generation = sessionGeneration
+        val letterMode = isLetterSelected
+        val writingMode = isWriting
+        val saveFrame = Settings.ExportData.frameIMG
         isRecording = false
         isProcessing = false
-        viewBinding.startProcessingButton.text = "Start Tracking"
-        viewBinding.startProcessingButton.backgroundTintList =
-            ContextCompat.getColorStateList(this, R.color.blue)
+        isFinalizing = true
+        viewBinding.startProcessingButton.isEnabled = false
+        viewBinding.startProcessingButton.text = "Finishing…"
+        viewBinding.startProcessingButton.backgroundTintList = ContextCompat.getColorStateList(this, R.color.blue)
         viewBinding.processedFrameView.visibility = View.GONE
         viewBinding.processedFrameView.setImageBitmap(null)
-        processedVideoRecorder?.stop()
-        processedVideoRecorder = null
 
-        val outputPath = get28x28OutputPath()
-        processedFrameRecorder = ProcessedFrameRecorder(outputPath)
-        with(Settings.ExportData) {
-            if (frameIMG) {
-                val bitmap = videoProcessor?.exportTraceForInference()
-                if (bitmap != null) {
-                    processedFrameRecorder?.save(bitmap)
+        // Queued after the last frame, so export and inference see a complete, stable trace.
+        processingExecutor.execute {
+            var prediction = ""
+            var coordinates = ""
+            try {
+                finishRecording()
+                val processor = videoProcessor!!
+                if (processor.hasTrace()) {
+                    coordinates = processor.getTrackingCoordinatesString()
+                    if (saveFrame) {
+                        val file = File.createTempFile("DrawnLine_28x28_", ".png", cacheDir)
+                        val bitmap = processor.exportTraceForInference()
+                        try {
+                            check(ProcessedFrameRecorder(file.path).save(bitmap)) { "Could not encode trace image" }
+                            MediaExporter.publish(this, file, false)
+                        } catch (error: Exception) {
+                            reportError("Could not save trace image", error)
+                        } finally {
+                            bitmap.recycle()
+                            file.delete()
+                        }
+                    }
+                    prediction = if (letterMode) runLetterRecognitionInference() else runDigitRecognitionInference()
+                }
+            } catch (error: Exception) {
+                reportError("Could not recognize this trace", error)
+            } finally {
+                runOnUiThread {
+                    isFinalizing = false
+                    if (!isDestroyed) {
+                        viewBinding.startProcessingButton.isEnabled = true
+                        viewBinding.startProcessingButton.text = "Start Tracking"
+                        if (generation == sessionGeneration) {
+                            trackingCoordinates = coordinates
+                            if (prediction.isNotEmpty()) {
+                                if (writingMode) {
+                                    accumulateCoordinates(coordinates)
+                                    val previous = viewBinding.predictedLetterTextView.text.toString()
+                                    viewBinding.predictedLetterTextView.text =
+                                        (if (previous == "No Prediction Yet") "" else previous) + prediction
+                                } else viewBinding.predictedLetterTextView.text = prediction
+                            } else if (!writingMode) {
+                                viewBinding.predictedLetterTextView.text = "No Prediction Yet"
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
 
-        initializeInferenceResult()
-
-        if (isWriting) {
-            val currentCoords = videoProcessor?.getTrackingCoordinatesString() ?: ""
-            if (currentCoords.isNotEmpty()) {
-                accumulateCoordinates(currentCoords)
-            }
-            val currentText = viewBinding.predictedLetterTextView.text.toString()
-            val newText = if (currentText == "No Prediction Available Yet") {
-                inferenceResult
-            } else {
-                currentText + inferenceResult
-            }
-            viewBinding.predictedLetterTextView.text = newText
-        } else {
-            viewBinding.predictedLetterTextView.text = inferenceResult
+    private fun finishRecording() {
+        val recorder = processedVideoRecorder
+        val file = recordingFile
+        processedVideoRecorder = null
+        recordingFile = null
+        try {
+            if (recorder?.stop() == true && file != null) MediaExporter.publish(this, file, true)
+        } catch (error: Exception) {
+            recorder?.cancel()
+            reportError("Could not save video", error)
+        } finally {
+            file?.delete()
         }
+    }
 
-        trackingCoordinates = videoProcessor?.getTrackingCoordinatesString() ?: ""
+    private fun discardRecording() {
+        processedVideoRecorder?.cancel()
+        processedVideoRecorder = null
+        recordingFile?.delete()
+        recordingFile = null
+    }
+
+    private fun reportError(message: String, error: Exception) {
+        Log.e("MainActivity", message, error)
+        runOnUiThread {
+            if (!isDestroyed) Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun launchExternalActivity(intent: Intent) {
+        try {
+            startActivity(intent)
+            shouldClearPrediction = true
+        } catch (error: ActivityNotFoundException) {
+            reportError("No installed app can handle this action", error)
+        }
     }
 
     // NEW: Function to accumulate and horizontally offset new tracking coordinates.
@@ -425,36 +466,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun get28x28OutputPath(): String {
-        @Suppress("DEPRECATION")
-        val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
-        val rollityDir = File(picturesDir, "Exported Lines from Xamera")
-        if (!rollityDir.exists()) {
-            rollityDir.mkdirs()
-        }
-        return File(rollityDir, "DrawnLine_28x28_${System.currentTimeMillis()}.png").absolutePath
-    }
-
-    private fun initializeInferenceResult() {
-        if (isLetterSelected) {
-            inferenceResult = runLetterRecognitionInference()
-        } else if (isDigitSelected) {
-            inferenceResult = runDigitRecognitionInference()
-        }
-    }
-
     private fun runDigitRecognitionInference(): String {
         val digitBitmap = videoProcessor?.exportTraceForInference()
         if (digitBitmap == null) {
             Log.e("MainActivity", "No digit image available for inference")
-            return "Error"
+            return ""
         }
         val grayBitmap = convertToGrayscale(digitBitmap)
         val inputBuffer = convertBitmapToGrayscaleByteBuffer(grayBitmap)
+        grayBitmap.recycle()
+        digitBitmap.recycle()
         val outputArray = Array(1) { FloatArray(10) }
         if (tfliteInterpreter == null) {
             Log.e("MainActivity", "Digit model interpreter not set")
-            return "Error"
+            return ""
         }
         tfliteInterpreter?.run(inputBuffer, outputArray)
         val predictedDigit = outputArray[0].indices.maxByOrNull { outputArray[0][it] } ?: -1
@@ -466,21 +491,23 @@ class MainActivity : AppCompatActivity() {
         val letterBitmap = videoProcessor?.exportTraceForInference()
         if (letterBitmap == null) {
             Log.e("MainActivity", "No letter image available for inference")
-            return "Error"
+            return ""
         }
         val grayBitmap = convertToGrayscale(letterBitmap)
         val inputBuffer = convertBitmapToGrayscaleByteBuffer(grayBitmap)
+        grayBitmap.recycle()
+        letterBitmap.recycle()
         val outputArray = Array(1) { FloatArray(26) }
         if (letterInterpreter == null) {
             Log.e("MainActivity", "Letter model interpreter not set")
-            return "Error"
+            return ""
         }
         letterInterpreter?.run(inputBuffer, outputArray)
         val maxIndex = outputArray[0].indices.maxByOrNull { outputArray[0][it] } ?: -1
         if (maxIndex == -1) {
-            return "Error"
+            return ""
         }
-        val predictedLetter = ('A'.toInt() + maxIndex).toChar()
+        val predictedLetter = ('A'.code + maxIndex).toChar()
         Log.d("MainActivity", "Letter model predicted: $predictedLetter")
         return predictedLetter.toString()
     }
@@ -504,9 +531,11 @@ class MainActivity : AppCompatActivity() {
         bitmap.getPixels(intValues, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
         for (pixel in intValues) {
             val r = (pixel shr 16 and 0xFF).toFloat()
-            val normalized = r / 255.0f
+            // Both classifiers were trained with Normalize(mean=0.5, std=0.5).
+            val normalized = r / 127.5f - 1.0f
             byteBuffer.putFloat(normalized)
         }
+        byteBuffer.rewind()
         return byteBuffer
     }
 
@@ -529,134 +558,54 @@ class MainActivity : AppCompatActivity() {
     private fun makePhoneCall(digits: String) {
         val callIntent = Intent(Intent.ACTION_DIAL)
         callIntent.data = Uri.parse("tel:$digits")
-        shouldClearPrediction = true
-        startActivity(callIntent)
+        launchExternalActivity(callIntent)
     }
 
     private fun processFrameWithVideoProcessor() {
-        if (isProcessingFrame) return
+        if (isProcessingFrame || !isProcessing) return
         val bitmap = viewBinding.viewFinder.bitmap ?: return
+        val generation = sessionGeneration
         isProcessingFrame = true
-        videoProcessor?.processFrame(bitmap) { processedFrames ->
+        processingExecutor.execute {
+            val frames = videoProcessor?.processFrame(bitmap)
+            bitmap.recycle()
+            try {
+                frames?.let { (_, recordingBitmap) -> processedVideoRecorder?.recordFrame(recordingBitmap) }
+            } catch (error: Exception) {
+                discardRecording()
+                reportError("Video saving stopped", error)
+            }
             runOnUiThread {
-                // If a reset is in progress, skip updating the UI.
-                if (isResetting) {
-                    isProcessingFrame = false
-                    return@runOnUiThread
-                }
-                processedFrames?.let { (outputBitmap, preprocessedBitmap) ->
-                    if (isProcessing) {
-                        viewBinding.processedFrameView.setImageBitmap(outputBitmap)
-                        with(Settings.ExportData) {
-                            if (videoDATA) {
-                                processedVideoRecorder?.recordFrame(preprocessedBitmap)
-                            }
-                        }
-                    }
-                }
-                if (videoProcessor?.getTrackingCoordinatesString().isNullOrEmpty()) {
-                    resetScreen()
-                }
                 isProcessingFrame = false
+                frames?.let { (output, recordingBitmap) ->
+                    if (generation == sessionGeneration && isProcessing && !isDestroyed) {
+                        viewBinding.processedFrameView.setImageBitmap(output)
+                    } else output.recycle()
+                    if (recordingBitmap !== output) recordingBitmap.recycle()
+                }
             }
         }
     }
 
-    private fun resetScreen() {
-        // Use the guard flag while resetting.
-        isResetting = true
-        viewBinding.processedFrameView.setImageBitmap(null)
-        viewBinding.predictedLetterTextView.text = "No Prediction Yet"
-        trackingCoordinates = ""
-        isResetting = false
-    }
-
-    private fun getProcessedVideoOutputPath(): String {
-        @Suppress("DEPRECATION")
-        val moviesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
-        if (!moviesDir.exists()) {
-            moviesDir.mkdirs()
-        }
-        return File(moviesDir, "Processed_${System.currentTimeMillis()}.mp4").absolutePath
-    }
-
-    private fun loadTFLiteModelOnStartupThreaded(modelName: String) {
-        Thread {
-            val bestLoadedPath = copyAssetModelBlocking(modelName)
-            runOnUiThread {
-                if (bestLoadedPath.isNotEmpty()) {
-                    try {
-                        val options = Interpreter.Options().apply {
-                            setNumThreads(Runtime.getRuntime().availableProcessors())
-                        }
-                        var delegateAdded = false
-                        try {
-                            val nnApiDelegate = NnApiDelegate()
-                            options.addDelegate(nnApiDelegate)
-                            delegateAdded = true
-                            Log.d("MainActivity", "NNAPI delegate added successfully.")
-                        } catch (e: Exception) {
-                            Log.d("MainActivity", "NNAPI delegate unavailable, falling back to GPU delegate.", e)
-                        }
-                        if (!delegateAdded) {
-                            try {
-                                val gpuDelegate = GpuDelegate()
-                                options.addDelegate(gpuDelegate)
-                                Log.d("MainActivity", "GPU delegate added successfully.")
-                            } catch (e: Exception) {
-                                Log.d("MainActivity", "GPU delegate unavailable, will use CPU only.", e)
-                            }
-                        }
-                        when (modelName) {
-                            "YOLOv3_float32.tflite" -> {
-                                videoProcessor?.setInterpreter(Interpreter(loadMappedFile(bestLoadedPath), options))
-                            }
-                            "DigitRecog_float32.tflite" -> {
-                                tfliteInterpreter = Interpreter(loadMappedFile(bestLoadedPath), options)
-                            }
-                            "LetterRecog_float32.tflite" -> {
-                                letterInterpreter = Interpreter(loadMappedFile(bestLoadedPath), options)
-                            }
-                            else -> Log.d("MainActivity", "No model processing method defined for $modelName")
-                        }
-                    } catch (e: Exception) {
-                        Toast.makeText(this, "Error loading TFLite model: ${e.message}", Toast.LENGTH_LONG).show()
-                        Log.d("MainActivity", "TFLite Interpreter error", e)
-                    }
-                } else {
-                    Toast.makeText(this, "Failed to copy or load $modelName", Toast.LENGTH_SHORT).show()
+    private fun loadModels() {
+        processingExecutor.execute {
+            try {
+                // CPU interpreters are created, used and closed on this worker. GPU delegates
+                // require thread affinity and can fail during interpreter creation on some phones.
+                fun load(name: String): Interpreter {
+                    val bytes = assets.open(name).use { it.readBytes() }
+                    val buffer = ByteBuffer.allocateDirect(bytes.size).order(ByteOrder.nativeOrder())
+                    buffer.put(bytes).rewind()
+                    return Interpreter(buffer, Interpreter.Options().setNumThreads(
+                        Runtime.getRuntime().availableProcessors().coerceIn(1, 4)))
                 }
+                videoProcessor?.setInterpreter(load("YOLOv3_float32.tflite"))
+                tfliteInterpreter = load("DigitRecog_float32.tflite")
+                letterInterpreter = load("LetterRecog_float32.tflite")
+                runOnUiThread { if (!isDestroyed) modelsReady = true }
+            } catch (error: Exception) {
+                reportError("Could not load recognition models", error)
             }
-        }.start()
-    }
-
-    private fun loadMappedFile(modelPath: String): MappedByteBuffer {
-        val file = File(modelPath)
-        val fileInputStream = file.inputStream()
-        val fileChannel = fileInputStream.channel
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, file.length())
-    }
-
-    private fun copyAssetModelBlocking(assetName: String): String {
-        return try {
-            val outFile = File(filesDir, assetName)
-            if (outFile.exists() && outFile.length() > 0) {
-                return outFile.absolutePath
-            }
-            assets.open(assetName).use { input ->
-                FileOutputStream(outFile).use { output ->
-                    val buffer = ByteArray(4 * 1024)
-                    var bytesRead: Int
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        output.write(buffer, 0, bytesRead)
-                    }
-                    output.flush()
-                }
-            }
-            outFile.absolutePath
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Error copying asset $assetName: ${e.message}")
-            ""
         }
     }
 
@@ -668,37 +617,42 @@ class MainActivity : AppCompatActivity() {
         isFrontCamera = !isFrontCamera
         cameraHelper.isFrontCamera = isFrontCamera
         cameraHelper.closeCamera()
-        cameraHelper.openCamera()
+        if (allPermissionsGranted() && isResumed) cameraHelper.openCamera()
     }
 
     override fun onResume() {
         super.onResume()
-        // Clear accumulated handwriting coordinates when returning.
-        accumulatedCoordinates.clear()
-
+        isResumed = true
+        Settings.load(sharedPreferences)
         cameraHelper.startBackgroundThread()
-        if (viewBinding.viewFinder.isAvailable) {
-            if (allPermissionsGranted()) {
-                cameraHelper.openCamera()
-            } else {
-                requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
-            }
-        } else {
-            viewBinding.viewFinder.surfaceTextureListener = textureListener
-        }
+        if (viewBinding.viewFinder.isAvailable && allPermissionsGranted()) cameraHelper.openCamera()
         if (shouldClearPrediction) {
+            sessionGeneration++
+            accumulatedCoordinates.clear()
+            trackingCoordinates = ""
             viewBinding.predictedLetterTextView.text = "No Prediction Yet"
             shouldClearPrediction = false
         }
     }
 
     override fun onPause() {
-        if (isRecording) {
-            stopProcessingAndRecording()
-        }
+        isResumed = false
+        if (isRecording) stopProcessingAndRecording()
         cameraHelper.closeCamera()
         cameraHelper.stopBackgroundThread()
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        sessionGeneration++
+        processingExecutor.execute {
+            discardRecording()
+            videoProcessor?.close()
+            tfliteInterpreter?.close()
+            letterInterpreter?.close()
+        }
+        processingExecutor.shutdown()
+        super.onDestroy()
     }
 
     private fun allPermissionsGranted(): Boolean {

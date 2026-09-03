@@ -18,4 +18,3 @@ dependencyResolutionManagement {
 
 rootProject.name = "Xamera"
 include(":app")
-include(":OpenCV-4.10.0")

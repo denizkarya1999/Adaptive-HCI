@@ -8,7 +8,7 @@ import java.io.IOException
 
 class ProcessedFrameRecorder(
     private val outputPath: String,
-    private val format: Bitmap.CompressFormat = Bitmap.CompressFormat.JPEG,
+    private val format: Bitmap.CompressFormat = Bitmap.CompressFormat.PNG,
     private val quality: Int = 100 // Quality range: 0 (lowest) to 100 (highest)
 ) {
     companion object {
